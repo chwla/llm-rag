@@ -1,6 +1,6 @@
 import os
 import time
-import tempfile
+import glob
 from typing import List, Dict, Any, Tuple, Optional
 import json
 from datetime import datetime
@@ -15,13 +15,19 @@ from langchain_community.document_loaders import (
 )
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 import chromadb
 from chromadb.utils.embedding_functions.ollama_embedding_function import OllamaEmbeddingFunction
 import ollama
 from sentence_transformers import CrossEncoder
 import numpy as np
+
+# ============================== #
+# Configuration
+# ============================== #
+# Directory containing your built-in documents
+DOCUMENTS_DIR = "./documents"  # Create this folder and add your PDFs/documents
+SUPPORTED_EXTENSIONS = [".pdf", ".txt", ".csv", ".docx", ".doc", ".pptx", ".ppt"]
 
 # ============================== #
 # System Prompt for LLM
@@ -56,8 +62,26 @@ def initialize_session_state():
         st.session_state.conversation_history = []
     if 'processed_files' not in st.session_state:
         st.session_state.processed_files = set()
-    if 'last_response_confidence' not in st.session_state:
-        st.session_state.last_response_confidence = None
+    if 'documents_loaded' not in st.session_state:
+        st.session_state.documents_loaded = False
+    if 'available_documents' not in st.session_state:
+        st.session_state.available_documents = []
+
+# ============================== #
+# Document Discovery
+# ============================== #
+def discover_documents() -> List[str]:
+    """Discover all supported documents in the documents directory"""
+    if not os.path.exists(DOCUMENTS_DIR):
+        os.makedirs(DOCUMENTS_DIR)
+        return []
+    
+    documents = []
+    for ext in SUPPORTED_EXTENSIONS:
+        pattern = os.path.join(DOCUMENTS_DIR, f"*{ext}")
+        documents.extend(glob.glob(pattern))
+    
+    return sorted(documents)
 
 # ============================== #
 # Document Loaders for Multiple Formats
@@ -84,49 +108,44 @@ def get_document_loader(file_path: str, file_type: str):
         return loader_class(file_path)
 
 # ============================== #
-# Process Multiple File Formats
+# Process Documents from Backend
 # ============================== #
-def process_document(uploaded_file: UploadedFile) -> List[Document]:
-    """Process uploaded document and return chunks"""
-    file_extension = uploaded_file.name.split('.')[-1].lower()
+def process_backend_document(file_path: str) -> List[Document]:
+    """Process document from backend directory and return chunks"""
+    file_name = os.path.basename(file_path)
+    file_extension = file_name.split('.')[-1].lower()
     
-    with tempfile.NamedTemporaryFile(
-        "wb", 
-        suffix=f".{file_extension}", 
-        delete=False
-    ) as temp_file:
-        temp_file.write(uploaded_file.read())
-        temp_path = temp_file.name
-
     try:
-        loader = get_document_loader(temp_path, file_extension)
+        loader = get_document_loader(file_path, file_extension)
         docs = loader.load()
         
         # Add file metadata
+        file_stats = os.stat(file_path)
         for doc in docs:
             doc.metadata.update({
-                'source_file': uploaded_file.name,
+                'source_file': file_name,
                 'file_type': file_extension,
-                'upload_time': datetime.now().isoformat(),
-                'file_size': len(uploaded_file.getvalue())
+                'file_path': file_path,
+                'file_size': file_stats.st_size,
+                'modified_time': datetime.fromtimestamp(file_stats.st_mtime).isoformat()
             })
         
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,  # Increased for better context
+            chunk_size=800,
             chunk_overlap=150,
             separators=["\n\n", "\n", ".", "?", "!", " ", ""],
         )
         return splitter.split_documents(docs)
     
-    finally:
-        os.unlink(temp_path)
+    except Exception as e:
+        st.error(f"Error processing {file_name}: {e}")
+        return []
 
 # ============================== #
 # Get/Create Vector Collection
 # ============================== #
 def get_vector_collection() -> chromadb.Collection:
     """Get or create vector collection with embeddings"""
-    # Use your original working model configuration
     embedding_fn = OllamaEmbeddingFunction(
         url="http://localhost:11434/api/embeddings",
         model_name="nomic-embed-text:latest"
@@ -165,8 +184,66 @@ def add_to_vector_collection(all_splits: List[Document], file_name: str):
             return False
     
     st.session_state.processed_files.add(file_name)
-    st.success(f"✅ {file_name} added to vector store!")
     return True
+
+# ============================== #
+# Load All Backend Documents
+# ============================== #
+def load_backend_documents():
+    """Load all documents from the backend directory into vector store"""
+    if st.session_state.documents_loaded:
+        return
+    
+    document_paths = discover_documents()
+    st.session_state.available_documents = [os.path.basename(path) for path in document_paths]
+    
+    if not document_paths:
+        st.warning("⚠️ No documents found in the documents directory. Please add some documents to get started.")
+        return
+    
+    # Check if documents are already processed
+    try:
+        collection = get_vector_collection()
+        existing_docs = collection.get(limit=1000)
+        existing_files = set()
+        for metadata in existing_docs.get('metadatas', []):
+            if metadata and 'source_file' in metadata:
+                existing_files.add(metadata['source_file'])
+        
+        new_documents = [path for path in document_paths 
+                        if os.path.basename(path) not in existing_files]
+        
+        if new_documents:
+            progress_bar = st.progress(0)
+            st.info(f"📚 Loading {len(new_documents)} new documents...")
+            
+            for i, doc_path in enumerate(new_documents):
+                file_name = os.path.basename(doc_path)
+                try:
+                    chunks = process_backend_document(doc_path)
+                    if chunks:
+                        success = add_to_vector_collection(chunks, file_name)
+                        if success:
+                            st.success(f"✅ Loaded: {file_name}")
+                    else:
+                        st.warning(f"⚠️ No content extracted from: {file_name}")
+                except Exception as e:
+                    st.error(f"❌ Failed to load {file_name}: {e}")
+                
+                progress_bar.progress((i + 1) / len(new_documents))
+            
+            progress_bar.empty()
+        else:
+            st.info("📚 All documents are already loaded in the vector store.")
+            # Update processed files from existing metadata
+            for metadata in existing_docs.get('metadatas', []):
+                if metadata and 'source_file' in metadata:
+                    st.session_state.processed_files.add(metadata['source_file'])
+    
+    except Exception as e:
+        st.error(f"Error checking existing documents: {e}")
+    
+    st.session_state.documents_loaded = True
 
 # ============================== #
 # Query Collection with Filtering
@@ -280,6 +357,7 @@ def clear_vector_store():
         client.delete_collection("rag_app")
         st.session_state.processed_files.clear()
         st.session_state.conversation_history.clear()
+        st.session_state.documents_loaded = False
         st.success("🗑️ Vector store cleared successfully!")
         return True
     except Exception as e:
@@ -293,8 +371,7 @@ def get_available_files_and_types():
     """Get list of processed files and file types"""
     try:
         collection = get_vector_collection()
-        # Get a sample of metadata to determine available files and types
-        results = collection.get(limit=1000)  # Get more metadata
+        results = collection.get(limit=1000)
         
         files = set()
         file_types = set()
@@ -315,19 +392,18 @@ def get_available_files_and_types():
 # ============================== #
 if __name__ == "__main__":
     st.set_page_config(
-        page_title="Enhanced RAG Q&A", 
+        page_title="Document Q&A System", 
         page_icon="📚",
         layout="wide"
     )
     
     initialize_session_state()
     
-    # Sidebar for file upload and management
-    st.sidebar.header("📁 Document Management")
+    # Sidebar for system status and document management
+    st.sidebar.header("📊 System Status")
     
-    # Simple Ollama status check
+    # Ollama status check
     try:
-        # Test embedding function
         collection = get_vector_collection()
         st.sidebar.success("🤖 Models Ready")
     except Exception as e:
@@ -336,56 +412,54 @@ if __name__ == "__main__":
         st.sidebar.markdown("**Quick fix:**")
         st.sidebar.code("ollama pull nomic-embed-text", language="bash")
     
-    # File upload
-    uploaded_files = st.sidebar.file_uploader(
-        "**Upload Documents**", 
-        type=["pdf", "txt", "csv", "docx", "doc", "pptx", "ppt"],
-        accept_multiple_files=True
-    )
+    # Document loading section
+    st.sidebar.subheader("📁 Document Library")
     
-    col1, col2 = st.sidebar.columns(2)
-    process = col1.button("📤 Process", type="primary")
-    clear_store = col2.button("🗑️ Clear Store", type="secondary")
+    # Load backend documents automatically
+    with st.sidebar:
+        if st.button("🔄 Refresh Documents", type="secondary"):
+            st.session_state.documents_loaded = False
+            st.session_state.processed_files.clear()
+        
+        load_backend_documents()
     
-    # Process uploaded files
-    if uploaded_files and process:
-        progress_bar = st.sidebar.progress(0)
-        for i, uploaded_file in enumerate(uploaded_files):
-            file_name = uploaded_file.name.translate(
-                str.maketrans({"-": "_", ".": "_", " ": "_"})
-            )
-            
-            if file_name not in st.session_state.processed_files:
-                try:
-                    chunks = process_document(uploaded_file)
-                    add_to_vector_collection(chunks, uploaded_file.name)
-                except Exception as e:
-                    st.sidebar.error(f"Error processing {uploaded_file.name}: {e}")
-            else:
-                st.sidebar.info(f"📄 {uploaded_file.name} already processed")
-            
-            progress_bar.progress((i + 1) / len(uploaded_files))
+    # Show document statistics
+    if st.session_state.available_documents:
+        st.sidebar.success(f"📚 {len(st.session_state.available_documents)} documents available")
+        with st.sidebar.expander("📋 Document List"):
+            for doc in st.session_state.available_documents:
+                status = "✅" if doc in st.session_state.processed_files else "⏳"
+                st.write(f"{status} {doc}")
+    else:
+        st.sidebar.info("📂 No documents found")
+        st.sidebar.markdown(f"**Add documents to:** `{DOCUMENTS_DIR}/`")
     
-    # Clear vector store
-    if clear_store:
+    # Clear vector store option
+    if st.sidebar.button("🗑️ Clear Vector Store", type="secondary"):
         clear_vector_store()
     
-    # Show processed files
-    if st.session_state.processed_files:
-        st.sidebar.subheader("📋 Processed Files")
-        for file in st.session_state.processed_files:
-            st.sidebar.text(f"✅ {file}")
-    
     # Main app
-    st.header("📚 Enhanced RAG Question & Answer")
-    st.markdown("*Ask questions from your uploaded documents with advanced filtering and conversation memory*")
+    st.header("📚 Document Q&A System")
+    st.markdown("*Ask questions from your document library with advanced filtering and conversation memory*")
+    
+    # Show instructions if no documents
+    if not st.session_state.available_documents:
+        st.info(f"""
+        **Getting Started:**
+        1. Create a folder named `{DOCUMENTS_DIR}` in your project directory
+        2. Add your PDF, TXT, CSV, DOCX, or PPTX files to this folder
+        3. Click the "🔄 Refresh Documents" button in the sidebar
+        4. Start asking questions!
+        
+        **Supported formats:** PDF, TXT, CSV, DOCX, DOC, PPTX, PPT
+        """)
     
     # Get available files and types for filtering
     available_files, available_types = get_available_files_and_types()
     
     # Filtering options (only show if we have documents)
-    if available_files or available_types or st.session_state.processed_files:
-        st.subheader("🔍 Filters")
+    if available_files or available_types:
+        st.subheader("🔍 Search Filters")
         col1, col2, col3 = st.columns(3)
         
         with col1:
@@ -405,7 +479,6 @@ if __name__ == "__main__":
         with col3:
             top_k = st.slider("Top Results", 1, 10, 3, key="top_k")
     else:
-        # Set default values if no documents
         file_filter = "All Files"
         type_filter = "All Types"
         top_k = 3
@@ -421,31 +494,15 @@ if __name__ == "__main__":
     ask = st.button("🚀 Ask", type="primary")
     
     if ask and prompt:
-        # Check if we have any processed documents
-        has_documents = bool(st.session_state.processed_files)
-        
-        # If session state is empty, try checking vector store directly
-        if not has_documents:
-            try:
-                collection = get_vector_collection()
-                result = collection.get(limit=1)  # Try to get just one document
-                has_documents = len(result.get('documents', [])) > 0
-            except:
-                has_documents = False
-        
-        if not has_documents:
-            st.warning("⚠️ Please upload and process some documents first!")
+        if not st.session_state.processed_files:
+            st.warning("⚠️ No documents are loaded. Please add documents to the documents folder and refresh.")
         else:
             with st.spinner("🔍 Searching and analyzing documents..."):
-                # Query with filters
-                file_filter_val = file_filter if 'file_filter' in locals() else None
-                type_filter_val = type_filter if 'type_filter' in locals() else None
-                
                 results = query_collection(
                     prompt, 
-                    n_results=15,  # Get more results for better re-ranking
-                    file_filter=file_filter_val,
-                    file_type_filter=type_filter_val
+                    n_results=15,
+                    file_filter=file_filter if file_filter != "All Files" else None,
+                    file_type_filter=type_filter if type_filter != "All Types" else None
                 )
                 raw_docs = results.get("documents", [[]])[0]
                 raw_metadatas = results.get("metadatas", [[]])[0]
@@ -454,9 +511,8 @@ if __name__ == "__main__":
                     st.warning("🔍 No relevant documents found. Try adjusting your filters or question.")
                 else:
                     # Re-rank and get confidence scores
-                    top_k_val = top_k if 'top_k' in locals() else 3
                     relevant_text, relevant_ids, confidence_scores = re_rank_cross_encoders(
-                        prompt, raw_docs, top_k_val
+                        prompt, raw_docs, top_k
                     )
                     
                     # Get conversation context
@@ -475,7 +531,6 @@ if __name__ == "__main__":
                     
                     # Calculate overall confidence
                     avg_confidence = np.mean(confidence_scores)
-                    st.session_state.last_response_confidence = avg_confidence
                     
                     # Add to conversation history
                     add_to_conversation(prompt, full_response, avg_confidence)
@@ -508,19 +563,12 @@ if __name__ == "__main__":
                                 st.write(f"📄 {file}")
                     
                     with st.expander("📑 Retrieved Chunks"):
-                        for i, (doc, metadata) in enumerate(zip(raw_docs, raw_metadatas)):
-                            st.write(f"**Chunk {i+1}:**")
+                        for i, (doc, metadata) in enumerate(zip([raw_docs[idx] for idx in relevant_ids], 
+                                                              [raw_metadatas[idx] for idx in relevant_ids])):
+                            st.write(f"**Relevant Chunk {i+1} (Score: {confidence_scores[i]:.2%}):**")
                             if metadata:
                                 st.write(f"*Source: {metadata.get('source_file', 'Unknown')}*")
                             st.write(doc)
-                            st.divider()
-                    
-                    with st.expander("⭐ Most Relevant Chunks"):
-                        for i, idx in enumerate(relevant_ids):
-                            st.write(f"**Top Chunk {i+1} (Score: {confidence_scores[i]:.2%}):**")
-                            if idx < len(raw_metadatas) and raw_metadatas[idx]:
-                                st.write(f"*Source: {raw_metadatas[idx].get('source_file', 'Unknown')}*")
-                            st.write(raw_docs[idx])
                             st.divider()
     
     # Conversation History
@@ -535,4 +583,4 @@ if __name__ == "__main__":
     
     # Footer
     st.markdown("---")
-    st.markdown("*Enhanced RAG Application with Multi-format Support, Filtering, Conversation Memory & Confidence Scoring*")
+    st.markdown("*Document Q&A System - Powered by Local Embeddings & LLM*")
