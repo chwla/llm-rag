@@ -3,7 +3,9 @@ import time
 import glob
 from typing import List, Dict, Any, Tuple, Optional
 import json
-from datetime import datetime
+import hashlib
+import pickle
+from datetime import datetime, timedelta
 
 import streamlit as st
 from langchain_community.document_loaders import (
@@ -21,6 +23,7 @@ from chromadb.utils.embedding_functions.ollama_embedding_function import OllamaE
 import ollama
 from sentence_transformers import CrossEncoder
 import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ============================== #
 # Configuration
@@ -28,6 +31,11 @@ import numpy as np
 # Directory containing your built-in documents
 DOCUMENTS_DIR = "./documents"  # Create this folder and add your PDFs/documents
 SUPPORTED_EXTENSIONS = [".pdf", ".txt", ".csv", ".docx", ".doc", ".pptx", ".ppt"]
+
+# Semantic caching configuration
+CACHE_DIR = "./semantic_cache"
+CACHE_EXPIRY_HOURS = 24  # Cache expires after 24 hours
+SIMILARITY_THRESHOLD = 0.85  # Threshold for semantic similarity (0.0 to 1.0)
 
 # ============================== #
 # System Prompt for LLM
@@ -129,6 +137,212 @@ def initialize_session_state():
         st.session_state.documents_loaded = False
     if 'available_documents' not in st.session_state:
         st.session_state.available_documents = []
+    if 'embedding_cache' not in st.session_state:
+        st.session_state.embedding_cache = {}
+
+# ============================== #
+# Semantic Caching System
+# ============================== #
+class SemanticCache:
+    def __init__(self, cache_dir: str = CACHE_DIR):
+        self.cache_dir = cache_dir
+        self.embeddings_cache_file = os.path.join(cache_dir, "query_embeddings.pkl")
+        self.responses_cache_file = os.path.join(cache_dir, "cached_responses.pkl")
+        self.embedding_function = None
+        os.makedirs(cache_dir, exist_ok=True)
+        self.load_cache()
+    
+    def load_cache(self):
+        """Load existing cache from disk"""
+        try:
+            if os.path.exists(self.embeddings_cache_file):
+                with open(self.embeddings_cache_file, 'rb') as f:
+                    self.query_embeddings = pickle.load(f)
+            else:
+                self.query_embeddings = {}
+            
+            if os.path.exists(self.responses_cache_file):
+                with open(self.responses_cache_file, 'rb') as f:
+                    self.cached_responses = pickle.load(f)
+            else:
+                self.cached_responses = {}
+        except Exception as e:
+            self.query_embeddings = {}
+            self.cached_responses = {}
+    
+    def save_cache(self):
+        """Save cache to disk"""
+        try:
+            with open(self.embeddings_cache_file, 'wb') as f:
+                pickle.dump(self.query_embeddings, f)
+            
+            with open(self.responses_cache_file, 'wb') as f:
+                pickle.dump(self.cached_responses, f)
+        except Exception as e:
+            pass  # Silent fail for caching
+    
+    def get_embedding_function(self):
+        """Get embedding function for semantic similarity"""
+        if self.embedding_function is None:
+            try:
+                self.embedding_function = OllamaEmbeddingFunction(
+                    url="http://localhost:11434/api/embeddings",
+                    model_name="nomic-embed-text:latest"
+                )
+            except:
+                return None
+        return self.embedding_function
+    
+    def get_query_embedding(self, query: str) -> Optional[np.ndarray]:
+        """Get embedding for a query"""
+        embedding_fn = self.get_embedding_function()
+        if embedding_fn is None:
+            return None
+        
+        try:
+            # Use session state cache for embeddings within the session
+            if query in st.session_state.embedding_cache:
+                return st.session_state.embedding_cache[query]
+            
+            embedding = embedding_fn([query])
+            if embedding and len(embedding) > 0:
+                embedding_array = np.array(embedding[0])
+                st.session_state.embedding_cache[query] = embedding_array
+                return embedding_array
+        except:
+            pass
+        return None
+    
+    def find_similar_query(self, query: str, filters: Dict[str, Any]) -> Optional[str]:
+        """Find semantically similar cached query"""
+        query_embedding = self.get_query_embedding(query)
+        if query_embedding is None:
+            return None
+        
+        # Create a unique key for the filter combination
+        filter_key = self._create_filter_key(filters)
+        
+        best_similarity = 0
+        best_match = None
+        
+        for cached_query, cached_data in self.query_embeddings.items():
+            # Check if filters match
+            if cached_data.get('filter_key') != filter_key:
+                continue
+            
+            # Check if cache is still valid
+            if self._is_cache_expired(cached_data.get('timestamp')):
+                continue
+            
+            # Calculate semantic similarity
+            cached_embedding = cached_data.get('embedding')
+            if cached_embedding is not None:
+                similarity = cosine_similarity(
+                    query_embedding.reshape(1, -1),
+                    cached_embedding.reshape(1, -1)
+                )[0][0]
+                
+                if similarity > SIMILARITY_THRESHOLD and similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = cached_query
+        
+        return best_match
+    
+    def get_cached_response(self, query: str) -> Optional[Dict[str, Any]]:
+        """Get cached response for a query"""
+        if query in self.cached_responses:
+            cached_data = self.cached_responses[query]
+            if not self._is_cache_expired(cached_data.get('timestamp')):
+                return cached_data
+        return None
+    
+    def cache_query_response(self, query: str, response_data: Dict[str, Any], filters: Dict[str, Any]):
+        """Cache a query and its response"""
+        query_embedding = self.get_query_embedding(query)
+        if query_embedding is None:
+            return
+        
+        # Cache query embedding with metadata
+        self.query_embeddings[query] = {
+            'embedding': query_embedding,
+            'timestamp': datetime.now().isoformat(),
+            'filter_key': self._create_filter_key(filters)
+        }
+        
+        # Cache response
+        self.cached_responses[query] = {
+            **response_data,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Clean up expired entries
+        self._cleanup_expired_cache()
+        
+        # Save to disk
+        self.save_cache()
+    
+    def _create_filter_key(self, filters: Dict[str, Any]) -> str:
+        """Create a consistent key for filter combinations"""
+        return hashlib.md5(str(sorted(filters.items())).encode()).hexdigest()
+    
+    def _is_cache_expired(self, timestamp_str: Optional[str]) -> bool:
+        """Check if cache entry is expired"""
+        if not timestamp_str:
+            return True
+        
+        try:
+            timestamp = datetime.fromisoformat(timestamp_str)
+            expiry_time = timestamp + timedelta(hours=CACHE_EXPIRY_HOURS)
+            return datetime.now() > expiry_time
+        except:
+            return True
+    
+    def _cleanup_expired_cache(self):
+        """Remove expired cache entries"""
+        current_time = datetime.now()
+        expired_queries = []
+        
+        for query, data in self.query_embeddings.items():
+            if self._is_cache_expired(data.get('timestamp')):
+                expired_queries.append(query)
+        
+        for query in expired_queries:
+            self.query_embeddings.pop(query, None)
+            self.cached_responses.pop(query, None)
+    
+    def clear_cache(self):
+        """Clear all cached data"""
+        self.query_embeddings = {}
+        self.cached_responses = {}
+        st.session_state.embedding_cache = {}
+        
+        # Remove cache files
+        for cache_file in [self.embeddings_cache_file, self.responses_cache_file]:
+            if os.path.exists(cache_file):
+                try:
+                    os.remove(cache_file)
+                except:
+                    pass
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get cache statistics"""
+        valid_entries = 0
+        expired_entries = 0
+        
+        for data in self.cached_responses.values():
+            if self._is_cache_expired(data.get('timestamp')):
+                expired_entries += 1
+            else:
+                valid_entries += 1
+        
+        return {
+            'valid_entries': valid_entries,
+            'expired_entries': expired_entries,
+            'total_entries': len(self.cached_responses)
+        }
+
+# Initialize semantic cache
+semantic_cache = SemanticCache()
 
 # ============================== #
 # Document Discovery
@@ -504,67 +718,121 @@ if __name__ == "__main__":
         if not st.session_state.processed_files:
             st.warning("⚠️ No documents are currently loaded. Please add documents to the documents folder and refresh the page.")
         else:
-            with st.spinner("🔍 Searching documents and preparing answer..."):
-                results = query_collection(
-                    prompt, 
-                    n_results=15,
-                    file_filter=file_filter if file_filter != "All Documents" else None,
-                    file_type_filter=type_filter if type_filter != "All Types" else None
-                )
-                raw_docs = results.get("documents", [[]])[0]
-                raw_metadatas = results.get("metadatas", [[]])[0]
-
-                if not raw_docs:
-                    st.warning("🔍 No relevant information found. Try rephrasing your question or adjusting the search filters.")
-                else:
-                    # Re-rank and get confidence scores
-                    relevant_text, relevant_ids, confidence_scores = re_rank_cross_encoders(
-                        prompt, raw_docs, top_k
+            # Prepare filter configuration for caching
+            filters = {
+                'file_filter': file_filter if file_filter != "All Documents" else None,
+                'type_filter': type_filter if type_filter != "All Types" else None,
+                'top_k': top_k
+            }
+            
+            # Check semantic cache first
+            similar_query = semantic_cache.find_similar_query(prompt, filters)
+            cached_response = None
+            
+            if similar_query:
+                cached_response = semantic_cache.get_cached_response(similar_query)
+                if cached_response:
+                    st.info("🎯 Found similar cached response - delivering faster results!")
+            
+            if cached_response:
+                # Use cached response
+                st.markdown("### 📋 Answer:")
+                st.markdown(cached_response['response'])
+                
+                # Show confidence score
+                confidence_color = "green" if cached_response['confidence'] > 0.7 else "orange" if cached_response['confidence'] > 0.4 else "red"
+                st.markdown(f"""
+                **Confidence Level:** 
+                <span style="color: {confidence_color}; font-weight: bold;">
+                {cached_response['confidence']:.0%}
+                </span> *(cached result)*
+                """, unsafe_allow_html=True)
+                
+                # Show source information
+                with st.expander("📄 Source Documents"):
+                    if cached_response.get('source_files'):
+                        st.write("**Information sourced from:**")
+                        for file in cached_response['source_files']:
+                            st.write(f"• {file}")
+                    else:
+                        st.write("Source information not available")
+                
+                # Add to conversation history
+                add_to_conversation(prompt, cached_response['response'], cached_response['confidence'])
+                
+            else:
+                # Process new query
+                with st.spinner("🔍 Searching documents and preparing answer..."):
+                    results = query_collection(
+                        prompt, 
+                        n_results=15,
+                        file_filter=file_filter if file_filter != "All Documents" else None,
+                        file_type_filter=type_filter if type_filter != "All Types" else None
                     )
-                    
-                    # Get conversation context
-                    conversation_context = get_conversation_context()
-                    
-                    # Generate response
-                    st.markdown("### 📋 Answer:")
-                    response_container = st.empty()
-                    full_response = ""
-                    
-                    for chunk in call_llm(relevant_text, prompt, conversation_context):
-                        full_response += chunk
-                        response_container.markdown(full_response + "▌")
-                    
-                    response_container.markdown(full_response)
-                    
-                    # Calculate overall confidence
-                    avg_confidence = np.mean(confidence_scores)
-                    
-                    # Add to conversation history
-                    add_to_conversation(prompt, full_response, avg_confidence)
-                    
-                    # Show confidence score
-                    confidence_color = "green" if avg_confidence > 0.7 else "orange" if avg_confidence > 0.4 else "red"
-                    st.markdown(f"""
-                    **Confidence Level:** 
-                    <span style="color: {confidence_color}; font-weight: bold;">
-                    {avg_confidence:.0%}
-                    </span>
-                    """, unsafe_allow_html=True)
-                    
-                    # Show source information
-                    with st.expander("📄 Source Documents"):
+                    raw_docs = results.get("documents", [[]])[0]
+                    raw_metadatas = results.get("metadatas", [[]])[0]
+
+                    if not raw_docs:
+                        st.warning("🔍 No relevant information found. Try rephrasing your question or adjusting the search filters.")
+                    else:
+                        # Re-rank and get confidence scores
+                        relevant_text, relevant_ids, confidence_scores = re_rank_cross_encoders(
+                            prompt, raw_docs, top_k
+                        )
+                        
+                        # Get conversation context
+                        conversation_context = get_conversation_context()
+                        
+                        # Generate response
+                        st.markdown("### 📋 Answer:")
+                        response_container = st.empty()
+                        full_response = ""
+                        
+                        for chunk in call_llm(relevant_text, prompt, conversation_context):
+                            full_response += chunk
+                            response_container.markdown(full_response + "▌")
+                        
+                        response_container.markdown(full_response)
+                        
+                        # Calculate overall confidence
+                        avg_confidence = np.mean(confidence_scores)
+                        
+                        # Get source files
                         used_files = set()
                         for idx in relevant_ids:
                             if idx < len(raw_metadatas) and raw_metadatas[idx]:
                                 source = raw_metadatas[idx].get('source_file', 'Unknown')
                                 used_files.add(source)
                         
-                        if used_files:
-                            st.write("**Information sourced from:**")
-                            for file in sorted(used_files):
-                                st.write(f"• {file}")
-                        else:
-                            st.write("Source information not available")
+                        # Cache the response
+                        cache_data = {
+                            'response': full_response,
+                            'confidence': avg_confidence,
+                            'source_files': sorted(list(used_files)),
+                            'relevant_chunks': len(relevant_ids)
+                        }
+                        semantic_cache.cache_query_response(prompt, cache_data, filters)
+                        
+                        # Add to conversation history
+                        add_to_conversation(prompt, full_response, avg_confidence)
+                        
+                        # Show confidence score
+                        confidence_color = "green" if avg_confidence > 0.7 else "orange" if avg_confidence > 0.4 else "red"
+                        st.markdown(f"""
+                        **Confidence Level:** 
+                        <span style="color: {confidence_color}; font-weight: bold;">
+                        {avg_confidence:.0%}
+                        </span>
+                        """, unsafe_allow_html=True)
+                        
+                        # Show source information
+                        with st.expander("📄 Source Documents"):
+                            if used_files:
+                                st.write("**Information sourced from:**")
+                                for file in sorted(used_files):
+                                    st.write(f"• {file}")
+                            else:
+                                st.write("Source information not available")
     
     # Conversation History
     if st.session_state.conversation_history:
