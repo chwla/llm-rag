@@ -261,7 +261,6 @@ def load_backend_documents():
     st.session_state.available_documents = [os.path.basename(path) for path in document_paths]
     
     if not document_paths:
-        st.warning("⚠️ No documents found in the documents directory. Please add some documents to get started.")
         return
     
     # Check if documents are already processed
@@ -277,34 +276,23 @@ def load_backend_documents():
                         if os.path.basename(path) not in existing_files]
         
         if new_documents:
-            progress_bar = st.progress(0)
-            st.info(f"📚 Loading {len(new_documents)} new documents...")
-            
-            for i, doc_path in enumerate(new_documents):
+            # Process documents silently in the background
+            for doc_path in new_documents:
                 file_name = os.path.basename(doc_path)
                 try:
                     chunks = process_backend_document(doc_path)
                     if chunks:
-                        success = add_to_vector_collection(chunks, file_name)
-                        if success:
-                            st.success(f"✅ Loaded: {file_name}")
-                    else:
-                        st.warning(f"⚠️ No content extracted from: {file_name}")
-                except Exception as e:
-                    st.error(f"❌ Failed to load {file_name}: {e}")
-                
-                progress_bar.progress((i + 1) / len(new_documents))
-            
-            progress_bar.empty()
+                        add_to_vector_collection(chunks, file_name)
+                except Exception:
+                    pass  # Silently handle errors
         else:
-            st.info("📚 All documents are already loaded in the vector store.")
             # Update processed files from existing metadata
             for metadata in existing_docs.get('metadatas', []):
                 if metadata and 'source_file' in metadata:
                     st.session_state.processed_files.add(metadata['source_file'])
     
-    except Exception as e:
-        st.error(f"Error checking existing documents: {e}")
+    except Exception:
+        pass  # Silently handle errors
     
     st.session_state.documents_loaded = True
 
@@ -411,23 +399,6 @@ def call_llm(context: str, prompt: str, conversation_context: str = ""):
             yield chunk["message"]["content"]
 
 # ============================== #
-# Clear Vector Store
-# ============================== #
-def clear_vector_store():
-    """Clear all data from vector store"""
-    try:
-        client = chromadb.PersistentClient(path="./demo-rag-chroma")
-        client.delete_collection("rag_app")
-        st.session_state.processed_files.clear()
-        st.session_state.conversation_history.clear()
-        st.session_state.documents_loaded = False
-        st.success("🗑️ Vector store cleared successfully!")
-        return True
-    except Exception as e:
-        st.error(f"Error clearing vector store: {e}")
-        return False
-
-# ============================== #
 # Get Available Files and Types
 # ============================== #
 def get_available_files_and_types():
@@ -455,80 +426,53 @@ def get_available_files_and_types():
 # ============================== #
 if __name__ == "__main__":
     st.set_page_config(
-        page_title="Document Q&A System", 
-        page_icon="📚",
+        page_title="School Safety Q&A System", 
+        page_icon="🏫",
         layout="wide"
     )
     
     initialize_session_state()
     
-    # Sidebar for system status and document management
-    st.sidebar.header("📊 System Status")
+    # Load documents silently in the background
+    load_backend_documents()
     
-    # Ollama status check
+    # Main header
+    st.title("🏫 School Safety Management Q&A System")
+    st.markdown("*Ask questions about fire safety protocols, disaster management guidelines, and training programs*")
+    
+    # Show system status if there are issues
     try:
         collection = get_vector_collection()
-        st.sidebar.success("🤖 Models Ready")
+        system_ready = True
     except Exception as e:
-        st.sidebar.error("❌ Model Issue")
-        st.sidebar.write(f"Error: {str(e)[:50]}...")
-        st.sidebar.markdown("**Quick fix:**")
-        st.sidebar.code("ollama pull nomic-embed-text", language="bash")
+        system_ready = False
+        st.error("⚠️ System initialization issue. Please ensure Ollama is running with the required models.")
+        st.code("ollama pull nomic-embed-text\nollama pull llama3.2:3b", language="bash")
     
-    # Document loading section
-    st.sidebar.subheader("📁 Document Library")
-    
-    # Load backend documents automatically
-    with st.sidebar:
-        if st.button("🔄 Process Documents", type="secondary"):
-            st.session_state.documents_loaded = False
-            st.session_state.processed_files.clear()
-        
-        load_backend_documents()
-    
-    # Show document statistics
-    if st.session_state.available_documents:
-        st.sidebar.success(f"📚 {len(st.session_state.available_documents)} documents available")
-        with st.sidebar.expander("📋 Document List"):
-            for doc in st.session_state.available_documents:
-                status = "✅" if doc in st.session_state.processed_files else "⏳"
-                st.write(f"{status} {doc}")
-    else:
-        st.sidebar.info("📂 No documents found")
-        st.sidebar.markdown(f"**Add documents to:** `{DOCUMENTS_DIR}/`")
-    
-    # Clear vector store option
-    if st.sidebar.button("🗑️ Clear Vector Store", type="secondary"):
-        clear_vector_store()
-    
-    # Main app
-    st.header("📚 Document Q&A System")
-    st.markdown("*Ask questions from your document library with advanced filtering and conversation memory*")
-    
-    # Show instructions if no documents
-    if not st.session_state.available_documents:
+    # Show document status
+    if not st.session_state.available_documents and system_ready:
         st.info(f"""
         **Getting Started:**
-        1. Create a folder named `{DOCUMENTS_DIR}` in your project directory
-        2. Add your PDF, TXT, CSV, DOCX, or PPTX files to this folder
-        3. Click the "🔄 Refresh Documents" button in the sidebar
-        4. Start asking questions!
+        
+        To use this system, add your school safety documents to the `{DOCUMENTS_DIR}` folder.
         
         **Supported formats:** PDF, TXT, CSV, DOCX, DOC, PPTX, PPT
         """)
+    elif st.session_state.available_documents:
+        st.success(f"📚 **{len(st.session_state.available_documents)} documents loaded** - System ready for questions")
     
     # Get available files and types for filtering
     available_files, available_types = get_available_files_and_types()
     
     # Filtering options (only show if we have documents)
     if available_files or available_types:
-        st.subheader("🔍 Search Filters")
+        st.subheader("🔍 Search Options")
         col1, col2, col3 = st.columns(3)
         
         with col1:
             file_filter = st.selectbox(
-                "Filter by File", 
-                ["All Files"] + available_files,
+                "Filter by Document", 
+                ["All Documents"] + available_files,
                 key="file_filter"
             )
         
@@ -540,38 +484,38 @@ if __name__ == "__main__":
             )
         
         with col3:
-            top_k = st.slider("Top Results", 1, 10, 3, key="top_k")
+            top_k = st.slider("Results to Consider", 1, 10, 3, key="top_k")
     else:
-        file_filter = "All Files"
+        file_filter = "All Documents"
         type_filter = "All Types"
         top_k = 3
     
     # Question input
     st.subheader("❓ Ask Your Question")
     prompt = st.text_area(
-        "**Enter your question here:**",
-        placeholder="What would you like to know from your documents?",
+        "Enter your question about school safety, fire protocols, or disaster management:",
+        placeholder="For example: What are the key components of a school fire safety plan?",
         height=100
     )
     
-    ask = st.button("🚀 Ask", type="primary")
+    ask = st.button("🚀 Get Answer", type="primary")
     
     if ask and prompt:
         if not st.session_state.processed_files:
-            st.warning("⚠️ No documents are loaded. Please add documents to the documents folder and refresh.")
+            st.warning("⚠️ No documents are currently loaded. Please add documents to the documents folder and refresh the page.")
         else:
-            with st.spinner("🔍 Searching and analyzing documents..."):
+            with st.spinner("🔍 Searching documents and preparing answer..."):
                 results = query_collection(
                     prompt, 
                     n_results=15,
-                    file_filter=file_filter if file_filter != "All Files" else None,
+                    file_filter=file_filter if file_filter != "All Documents" else None,
                     file_type_filter=type_filter if type_filter != "All Types" else None
                 )
                 raw_docs = results.get("documents", [[]])[0]
                 raw_metadatas = results.get("metadatas", [[]])[0]
 
                 if not raw_docs:
-                    st.warning("🔍 No relevant documents found. Try adjusting your filters or question.")
+                    st.warning("🔍 No relevant information found. Try rephrasing your question or adjusting the search filters.")
                 else:
                     # Re-rank and get confidence scores
                     relevant_text, relevant_ids, confidence_scores = re_rank_cross_encoders(
@@ -582,7 +526,7 @@ if __name__ == "__main__":
                     conversation_context = get_conversation_context()
                     
                     # Generate response
-                    st.markdown("### 🤖 Answer:")
+                    st.markdown("### 📋 Answer:")
                     response_container = st.empty()
                     full_response = ""
                     
@@ -601,49 +545,39 @@ if __name__ == "__main__":
                     # Show confidence score
                     confidence_color = "green" if avg_confidence > 0.7 else "orange" if avg_confidence > 0.4 else "red"
                     st.markdown(f"""
-                    **Confidence Score:** 
+                    **Confidence Level:** 
                     <span style="color: {confidence_color}; font-weight: bold;">
-                    {avg_confidence:.2%}
+                    {avg_confidence:.0%}
                     </span>
                     """, unsafe_allow_html=True)
                     
-                    # Expandable sections for details
-                    with st.expander("📊 Retrieval Details"):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write("**Individual Confidence Scores:**")
-                            for i, score in enumerate(confidence_scores):
-                                st.write(f"Chunk {i+1}: {score:.2%}")
+                    # Show source information
+                    with st.expander("📄 Source Documents"):
+                        used_files = set()
+                        for idx in relevant_ids:
+                            if idx < len(raw_metadatas) and raw_metadatas[idx]:
+                                source = raw_metadatas[idx].get('source_file', 'Unknown')
+                                used_files.add(source)
                         
-                        with col2:
-                            st.write("**Source Files:**")
-                            used_files = set()
-                            for idx in relevant_ids:
-                                if idx < len(raw_metadatas) and raw_metadatas[idx]:
-                                    source = raw_metadatas[idx].get('source_file', 'Unknown')
-                                    used_files.add(source)
-                            for file in used_files:
-                                st.write(f"📄 {file}mock ")
-                    
-                    with st.expander("📑 Retrieved Chunks"):
-                        for i, (doc, metadata) in enumerate(zip([raw_docs[idx] for idx in relevant_ids], 
-                                                              [raw_metadatas[idx] for idx in relevant_ids])):
-                            st.write(f"**Relevant Chunk {i+1} (Score: {confidence_scores[i]:.2%}):**")
-                            if metadata:
-                                st.write(f"*Source: {metadata.get('source_file', 'Unknown')}*")
-                            st.write(doc)
-                            st.divider()
+                        if used_files:
+                            st.write("**Information sourced from:**")
+                            for file in sorted(used_files):
+                                st.write(f"• {file}")
+                        else:
+                            st.write("Source information not available")
     
     # Conversation History
     if st.session_state.conversation_history:
-        st.subheader("💬 Conversation History")
+        st.markdown("---")
+        st.subheader("💬 Recent Questions")
         with st.expander("View Previous Questions & Answers"):
-            for i, entry in enumerate(reversed(st.session_state.conversation_history)):
-                st.write(f"**Q{len(st.session_state.conversation_history)-i}:** {entry['question']}")
-                st.write(f"**A:** {entry['answer']}")
-                st.write(f"*Confidence: {entry['confidence']:.2%} | Time: {entry['timestamp'][:19]}*")
-                st.divider()
+            for i, entry in enumerate(reversed(st.session_state.conversation_history[-5:])):  # Show last 5
+                st.write(f"**Q:** {entry['question']}")
+                st.write(f"**A:** {entry['answer'][:200]}{'...' if len(entry['answer']) > 200 else ''}")
+                st.write(f"*Confidence: {entry['confidence']:.0%} | {entry['timestamp'][:19].replace('T', ' ')}*")
+                if i < len(st.session_state.conversation_history) - 1:
+                    st.divider()
     
     # Footer
     st.markdown("---")
-    st.markdown("*Document Q&A System - Powered by Local Embeddings & LLM*")
+    st.markdown("*School Safety Management Q&A System - Providing expert guidance for educational institutions*")
